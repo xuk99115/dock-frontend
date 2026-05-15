@@ -1,0 +1,1522 @@
+package market
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"nofx/config"
+	"nofx/logger"
+	"nofx/provider/binance"
+	"nofx/provider/coinank/coinank_api"
+	"nofx/provider/coinank/coinank_enum"
+	"nofx/provider/hyperliquid"
+	"nofx/store"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// getCurrentPriceWithFallback gets real-time price from ticker API with fallback to K-line data
+func getCurrentPriceWithFallback(symbol string, klines []Kline) (float64, string) {
+	if len(klines) == 0 {
+		return 0, "no_data"
+	}
+
+	// Try to get real-time price from ticker API
+	apiClient := NewAPIClient()
+	realtimePrice, err := apiClient.GetCurrentPrice(symbol)
+	if err != nil {
+		logger.Infof("⚠️  %s failed to get real-time price from ticker API: %v, falling back to K-line data", symbol, err)
+		return klines[len(klines)-1].Close, "kline_fallback"
+	}
+
+	// Validate real-time price against K-line data for staleness detection
+	klinePrice := klines[len(klines)-1].Close
+	priceDeviation := math.Abs(realtimePrice-klinePrice) / klinePrice
+
+	// If the deviation is too large (>2%), the ticker might be stale
+	// But skip warning for test data where K-line price is suspiciously small (e.g., <10 when real price >1000)
+	if priceDeviation > config.MaxPriceDeviationThreshold {
+		// Only warn if both prices seem realistic (avoid test data noise)
+		if klinePrice > 1.0 || realtimePrice < 1000.0 {
+			logger.Infof("⚠️  %s ticker price deviation %.2f%% from K-line (ticker: %.4f, kline: %.4f), using K-line data",
+				symbol, priceDeviation*100, realtimePrice, klinePrice)
+		}
+		return klinePrice, "ticker_stale"
+	}
+
+	// Real-time price looks good
+	logger.Infof("✅ %s using real-time ticker price: %.4f (deviation: %.3f%% from K-line)",
+		symbol, realtimePrice, priceDeviation*100)
+	return realtimePrice, "ticker_realtime"
+}
+
+// FundingRateCache is the funding rate cache structure
+// Binance Funding Rate only updates every 8 hours, using 1-hour cache can significantly reduce API calls
+type FundingRateCache struct {
+	Rate      float64
+	UpdatedAt time.Time
+}
+
+var (
+	fundingRateMap sync.Map // map[string]*FundingRateCache
+	frCacheTTL     = 1 * time.Hour
+)
+
+// Note: Kline data now uses free/open API (coinank_api.Kline) which doesn't require authentication
+
+// getKlinesFromBinance fetches kline data from Binance and converts to market.Kline format
+func getKlinesFromBinance(symbol, interval string, limit int) ([]Kline, error) {
+	ctx := context.Background()
+
+	binanceKlines, err := binance.GetKlinesFromBinance(ctx, symbol, interval, limit)
+	if err != nil {
+		return nil, fmt.Errorf("binance API error: %w", err)
+	}
+
+	// Convert binance.Kline to market.Kline
+	klines := make([]Kline, len(binanceKlines))
+	for i, bk := range binanceKlines {
+		klines[i] = Kline{
+			OpenTime:  bk.OpenTime,
+			Open:      bk.Open,
+			High:      bk.High,
+			Low:       bk.Low,
+			Close:     bk.Close,
+			Volume:    bk.Volume,
+			CloseTime: bk.CloseTime,
+		}
+	}
+
+	return klines, nil
+}
+
+// getKlinesFromHyperliquid fetches kline data from Hyperliquid API for xyz dex assets
+func getKlinesFromHyperliquid(symbol, interval string, limit int) ([]Kline, error) {
+	// Remove xyz: prefix if present for the API call
+	baseCoin := strings.TrimPrefix(symbol, "xyz:")
+
+	// Map interval to Hyperliquid format
+	hlInterval := hyperliquid.MapTimeframe(interval)
+
+	// Create Hyperliquid client
+	client := hyperliquid.NewClient()
+
+	// Fetch candles
+	ctx := context.Background()
+	candles, err := client.GetCandles(ctx, baseCoin, hlInterval, limit)
+	if err != nil {
+		return nil, fmt.Errorf("hyperliquid API error: %w", err)
+	}
+
+	// Convert to market.Kline format
+	klines := make([]Kline, len(candles))
+	for i, c := range candles {
+		open, _ := strconv.ParseFloat(c.Open, 64)
+		high, _ := strconv.ParseFloat(c.High, 64)
+		low, _ := strconv.ParseFloat(c.Low, 64)
+		closePrice, _ := strconv.ParseFloat(c.Close, 64)
+		volume, _ := strconv.ParseFloat(c.Volume, 64)
+
+		klines[i] = Kline{
+			OpenTime:  c.OpenTime,
+			Open:      open,
+			High:      high,
+			Low:       low,
+			Close:     closePrice,
+			Volume:    volume,
+			CloseTime: c.CloseTime,
+		}
+	}
+
+	return klines, nil
+}
+
+// GetKlinesCoinank fetches kline data for crypto exchanges via CoinAnk (Binance default with multi-exchange support)
+// exchange: "binance", "bybit", "okx", "bitget", "aster"
+// interval: supports second/minute/hour/day/week/month intervals as provided by CoinAnk
+func GetKlinesCoinank(symbol, interval, exchange string, limit int) ([]Kline, error) {
+	// Map exchange string to coinank enum
+	var coinankExchange coinank_enum.Exchange
+	switch strings.ToLower(exchange) {
+	case "binance":
+		coinankExchange = coinank_enum.Binance
+	case "bybit":
+		coinankExchange = coinank_enum.Bybit
+	case "okx":
+		coinankExchange = coinank_enum.Okex
+	case "bitget":
+		coinankExchange = coinank_enum.Bitget
+	case "aster":
+		coinankExchange = coinank_enum.Aster
+	default:
+		logger.Warnf("⚠️ Unknown exchange '%s', defaulting to Binance for CoinAnk", exchange)
+		coinankExchange = coinank_enum.Binance
+	}
+
+	// Map interval string to coinank enum (extended set)
+	var coinankInterval coinank_enum.Interval
+	switch interval {
+	case "1s":
+		coinankInterval = coinank_enum.Second1
+	case "5s":
+		coinankInterval = coinank_enum.Second5
+	case "10s":
+		coinankInterval = coinank_enum.Second10
+	case "30s":
+		coinankInterval = coinank_enum.Second30
+	case "1m":
+		coinankInterval = coinank_enum.Minute1
+	case "3m":
+		coinankInterval = coinank_enum.Minute3
+	case "5m":
+		coinankInterval = coinank_enum.Minute5
+	case "10m":
+		coinankInterval = coinank_enum.Minute10
+	case "15m":
+		coinankInterval = coinank_enum.Minute15
+	case "30m":
+		coinankInterval = coinank_enum.Minute30
+	case "1h":
+		coinankInterval = coinank_enum.Hour1
+	case "2h":
+		coinankInterval = coinank_enum.Hour2
+	case "4h":
+		coinankInterval = coinank_enum.Hour4
+	case "6h":
+		coinankInterval = coinank_enum.Hour6
+	case "8h":
+		coinankInterval = coinank_enum.Hour8
+	case "12h":
+		coinankInterval = coinank_enum.Hour12
+	case "1d":
+		coinankInterval = coinank_enum.Day1
+	case "3d":
+		coinankInterval = coinank_enum.Day3
+	case "1w":
+		coinankInterval = coinank_enum.Week1
+	case "1M":
+		coinankInterval = coinank_enum.Month1
+	default:
+		return nil, fmt.Errorf("unsupported interval for coinank: %s", interval)
+	}
+
+	// Convert symbol format for different exchanges (e.g., OKX uses BTC-USDT-SWAP)
+	apiSymbol := symbol
+	if coinankExchange == coinank_enum.Okex {
+		if strings.HasSuffix(symbol, "USDT") {
+			base := strings.TrimSuffix(symbol, "USDT")
+			apiSymbol = fmt.Sprintf("%s-USDT-SWAP", base)
+		}
+	}
+
+	// Call CoinAnk free/open API
+	ctx := context.Background()
+	ts := time.Now().UnixMilli()
+	coinankKlines, err := coinank_api.Kline(ctx, apiSymbol, coinankExchange, ts, coinank_enum.To, limit, coinankInterval)
+	if err != nil {
+		// Fallback to Binance if unsupported
+		if coinankExchange != coinank_enum.Binance {
+			logger.Warnf("⚠️ CoinAnk free API doesn't support %s, falling back to Binance", coinankExchange)
+			coinankKlines, err = coinank_api.Kline(ctx, symbol, coinank_enum.Binance, ts, coinank_enum.To, limit, coinankInterval)
+			if err != nil {
+				return nil, fmt.Errorf("coinank API error (fallback): %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("coinank API error: %w", err)
+		}
+	}
+
+	// Convert to market.Kline format
+	klines := make([]Kline, len(coinankKlines))
+	for i, ck := range coinankKlines {
+		klines[i] = Kline{
+			OpenTime:  ck.StartTime,
+			Open:      ck.Open,
+			High:      ck.High,
+			Low:       ck.Low,
+			Close:     ck.Close,
+			Volume:    ck.Volume,
+			CloseTime: ck.EndTime,
+		}
+	}
+	return klines, nil
+}
+
+// GetKlinesHyperliquid fetches kline data from Hyperliquid (crypto perps and xyz dex assets)
+func GetKlinesHyperliquid(symbol, interval string, limit int) ([]Kline, error) {
+	return getKlinesFromHyperliquid(symbol, interval, limit)
+}
+
+// Get retrieves market data for the specified token
+func Get(symbol string) (*Data, error) {
+	var klines3m, klines4h []Kline
+	var err error
+	// Normalize symbol
+	symbol = Normalize(symbol)
+
+	// Check if this is an xyz dex asset (use Hyperliquid API)
+	isXyzAsset := IsXyzDexAsset(symbol)
+
+	// Get 3-minute K-line data (or 5-minute for xyz assets as 3m may not be available)
+	if isXyzAsset {
+		// Use Hyperliquid API for xyz dex assets (use 5m since 3m may not be available)
+		klines3m, err = getKlinesFromHyperliquid(symbol, "5m", 100)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get 5-minute K-line from Hyperliquid: %v", err)
+		}
+	} else {
+		// Use Binance for regular crypto assets
+		klines3m, err = getKlinesFromBinance(symbol, "3m", 100)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get 3-minute K-line from Binance: %v", err)
+		}
+	}
+
+	// Data staleness detection: Prevent DOGEUSDT-style price freeze issues
+	if isStaleData(klines3m, symbol) {
+		logger.Infof("⚠️  WARNING: %s detected stale data (consecutive price freeze), skipping symbol", symbol)
+		return nil, fmt.Errorf("%s data is stale, possible cache failure", symbol)
+	}
+
+	// Get 4-hour K-line data
+	if isXyzAsset {
+		klines4h, err = getKlinesFromHyperliquid(symbol, "4h", 100)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get 4-hour K-line from Hyperliquid: %v", err)
+		}
+	} else {
+		klines4h, err = getKlinesFromBinance(symbol, "4h", 100)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get 4-hour K-line from Binance: %v", err)
+		}
+	}
+
+	// Check if data is empty
+	if len(klines3m) == 0 {
+		return nil, fmt.Errorf("3-minute K-line data is empty")
+	}
+	if len(klines4h) == 0 {
+		return nil, fmt.Errorf("4-hour K-line data is empty")
+	}
+
+	// Calculate current indicators (based on 3-minute latest data)
+	// Get real-time current price with fallback to K-line data
+	currentPrice, priceSource := getCurrentPriceWithFallback(symbol, klines3m)
+
+	// Use default config if not provided
+	defaultConfig := &store.IndicatorConfig{
+		EMAPeriods:     []int{20},
+		RSIPeriods:     []int{7},
+		MACDFastPeriod: 12,
+		MACDSlowPeriod: 26,
+	}
+	currentEMA20 := calculateEMA(klines3m, defaultConfig.EMAPeriods[0])
+	currentMACD := calculateMACD(klines3m, defaultConfig.MACDFastPeriod, defaultConfig.MACDSlowPeriod)
+	currentRSI7 := calculateRSI(klines3m, defaultConfig.RSIPeriods[0])
+
+	// Log price source for debugging
+	logger.Infof("📊 %s price source: %s, current_price: %.4f", symbol, priceSource, currentPrice)
+
+	// Calculate price change percentage
+	// 1-hour price change = price from 20 3-minute K-lines ago
+	priceChange1h := 0.0
+	if len(klines3m) >= 21 { // Need at least 21 K-lines (current + 20 previous)
+		price1hAgo := klines3m[len(klines3m)-21].Close
+		if price1hAgo > 0 {
+			priceChange1h = ((currentPrice - price1hAgo) / price1hAgo) * 100
+		}
+	}
+
+	// 4-hour price change = price from 1 4-hour K-line ago
+	priceChange4h := 0.0
+	if len(klines4h) >= 2 {
+		price4hAgo := klines4h[len(klines4h)-2].Close
+		if price4hAgo > 0 {
+			priceChange4h = ((currentPrice - price4hAgo) / price4hAgo) * 100
+		}
+	}
+
+	// Get OI data
+	oiData, err := getOpenInterestData(symbol)
+	if err != nil {
+		// OI failure doesn't affect overall result, use default values
+		oiData = &OIData{Latest: 0, Average: 0}
+	}
+
+	// Get Funding Rate
+	fundingRate, _ := getFundingRate(symbol)
+
+	// Calculate intraday series data
+	intradayData := calculateIntradaySeries(klines3m)
+
+	// Calculate longer-term data
+	longerTermData := calculateLongerTermData(klines4h, nil)
+
+	return &Data{
+		Symbol:            symbol,
+		CurrentPrice:      currentPrice,
+		PriceChange1h:     priceChange1h,
+		PriceChange4h:     priceChange4h,
+		CurrentEMA20:      currentEMA20,
+		CurrentMACD:       currentMACD,
+		CurrentRSI7:       currentRSI7,
+		OpenInterest:      oiData,
+		FundingRate:       fundingRate,
+		IntradaySeries:    intradayData,
+		LongerTermContext: longerTermData,
+	}, nil
+}
+
+// GetWithTimeframes retrieves market data for specified multiple timeframes
+// timeframes: list of timeframes, e.g. ["5m", "15m", "1h", "4h"]
+// primaryTimeframe: primary timeframe (used for calculating current indicators), defaults to timeframes[0]
+// count: number of K-lines for each timeframe
+func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, count int) (*Data, error) {
+	symbol = Normalize(symbol)
+
+	if len(timeframes) == 0 {
+		return nil, fmt.Errorf("at least one timeframe is required")
+	}
+
+	// If primary timeframe is not specified, use the first one
+	if primaryTimeframe == "" {
+		primaryTimeframe = timeframes[0]
+	}
+
+	// Ensure primary timeframe is in the list
+	hasPrimary := false
+	for _, tf := range timeframes {
+		if tf == primaryTimeframe {
+			hasPrimary = true
+			break
+		}
+	}
+	if !hasPrimary {
+		timeframes = append([]string{primaryTimeframe}, timeframes...)
+	}
+
+	// Store data for all timeframes
+	timeframeData := make(map[string]*TimeframeSeriesData)
+	var primaryKlines []Kline
+
+	// Check if this is an xyz dex asset (use Hyperliquid API)
+	isXyzAsset := IsXyzDexAsset(symbol)
+
+	// Get K-line data for each timeframe
+	for _, tf := range timeframes {
+		var klines []Kline
+		var err error
+
+		if isXyzAsset {
+			// Use Hyperliquid API for xyz dex assets
+			klines, err = getKlinesFromHyperliquid(symbol, tf, 200)
+			if err != nil {
+				logger.Infof("⚠️ Failed to get %s %s K-line from Hyperliquid: %v", symbol, tf, err)
+				continue
+			}
+		} else {
+			// Use Binance for regular crypto assets
+			klines, err = getKlinesFromBinance(symbol, tf, 200)
+			if err != nil {
+				logger.Infof("⚠️ Failed to get %s %s K-line from Binance: %v", symbol, tf, err)
+				continue
+			}
+		}
+
+		if len(klines) == 0 {
+			logger.Infof("⚠️ %s %s K-line data is empty", symbol, tf)
+			continue
+		}
+
+		// Save primary timeframe K-lines for calculating base indicators
+		if tf == primaryTimeframe {
+			primaryKlines = klines
+		}
+
+		// Calculate series data for this timeframe (use count from config)
+		seriesData := calculateTimeframeSeries(klines, tf, count, nil)
+		timeframeData[tf] = seriesData
+	}
+
+	// If primary timeframe data is empty, return error
+	if len(primaryKlines) == 0 {
+		return nil, fmt.Errorf("primary timeframe %s K-line data is empty", primaryTimeframe)
+	}
+
+	// Data staleness detection
+	if isStaleData(primaryKlines, symbol) {
+		logger.Infof("⚠️  WARNING: %s detected stale data (consecutive price freeze), skipping symbol", symbol)
+		return nil, fmt.Errorf("%s data is stale, possible cache failure", symbol)
+	}
+
+	// Calculate current indicators (based on primary timeframe latest data)
+	// Get real-time current price with fallback to K-line data
+	currentPrice, priceSource := getCurrentPriceWithFallback(symbol, primaryKlines)
+
+	// Use default config if not provided
+	defaultConfig := &store.IndicatorConfig{
+		EMAPeriods:     []int{20},
+		RSIPeriods:     []int{7},
+		MACDFastPeriod: 12,
+		MACDSlowPeriod: 26,
+	}
+	currentEMA20 := calculateEMA(primaryKlines, defaultConfig.EMAPeriods[0])
+	currentMACD := calculateMACD(primaryKlines, defaultConfig.MACDFastPeriod, defaultConfig.MACDSlowPeriod)
+	currentRSI7 := calculateRSI(primaryKlines, defaultConfig.RSIPeriods[0])
+
+	// Log price source for debugging
+	logger.Infof("📊 %s price source: %s, current_price: %.4f", symbol, priceSource, currentPrice)
+
+	// Calculate price changes
+	priceChange1h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 60)  // 1 hour
+	priceChange4h := calculatePriceChangeByBars(primaryKlines, primaryTimeframe, 240) // 4 hours
+
+	// Get OI data
+	oiData, err := getOpenInterestData(symbol)
+	if err != nil {
+		oiData = &OIData{Latest: 0, Average: 0}
+	}
+
+	// Get Funding Rate
+	fundingRate, _ := getFundingRate(symbol)
+
+	return &Data{
+		Symbol:        symbol,
+		CurrentPrice:  currentPrice,
+		PriceChange1h: priceChange1h,
+		PriceChange4h: priceChange4h,
+		CurrentEMA20:  currentEMA20,
+		CurrentMACD:   currentMACD,
+		CurrentRSI7:   currentRSI7,
+		OpenInterest:  oiData,
+		FundingRate:   fundingRate,
+		TimeframeData: timeframeData,
+	}, nil
+}
+
+// calculateTimeframeSeries calculates series data for a single timeframe
+func calculateTimeframeSeries(klines []Kline, timeframe string, count int, config *store.IndicatorConfig) *TimeframeSeriesData {
+	if count <= 0 {
+		count = 10 // default
+	}
+
+	// Set default config if not provided
+	if config == nil {
+		config = &store.IndicatorConfig{
+			EMAPeriods:     []int{20, 50},
+			RSIPeriods:     []int{7, 14},
+			ATRPeriods:     []int{14},
+			MACDFastPeriod: 12,
+			MACDSlowPeriod: 26,
+			BOLLPeriods:    []int{20},
+		}
+	}
+
+	// Set defaults for empty arrays
+	if len(config.EMAPeriods) == 0 {
+		config.EMAPeriods = []int{20, 50}
+	}
+	if len(config.RSIPeriods) == 0 {
+		config.RSIPeriods = []int{7, 14}
+	}
+	if len(config.ATRPeriods) == 0 {
+		config.ATRPeriods = []int{14}
+	}
+	if config.MACDFastPeriod == 0 {
+		config.MACDFastPeriod = 12
+	}
+	if config.MACDSlowPeriod == 0 {
+		config.MACDSlowPeriod = 26
+	}
+	if len(config.BOLLPeriods) == 0 {
+		config.BOLLPeriods = []int{20}
+	}
+
+	data := &TimeframeSeriesData{
+		Timeframe:   timeframe,
+		Klines:      make([]KlineBar, 0, count),
+		MidPrices:   make([]float64, 0, count),
+		EMA20Values: make([]float64, 0, count),
+		EMA50Values: make([]float64, 0, count),
+		MACDValues:  make([]float64, 0, count),
+		RSI7Values:  make([]float64, 0, count),
+		RSI14Values: make([]float64, 0, count),
+		Volume:      make([]float64, 0, count),
+		BOLLUpper:   make([]float64, 0, count),
+		BOLLMiddle:  make([]float64, 0, count),
+		BOLLLower:   make([]float64, 0, count),
+	}
+
+	// Get latest N data points based on count from config
+	start := len(klines) - count
+	if start < 0 {
+		start = 0
+	}
+
+	for i := start; i < len(klines); i++ {
+		// Store full OHLCV kline data
+		data.Klines = append(data.Klines, KlineBar{
+			Time:   klines[i].OpenTime,
+			Open:   klines[i].Open,
+			High:   klines[i].High,
+			Low:    klines[i].Low,
+			Close:  klines[i].Close,
+			Volume: klines[i].Volume,
+		})
+
+		// Keep MidPrices and Volume for backward compatibility
+		data.MidPrices = append(data.MidPrices, klines[i].Close)
+		data.Volume = append(data.Volume, klines[i].Volume)
+
+		// Calculate EMA for configured periods (backward compatible)
+		// For backward compatibility, use first two EMA periods for EMA20Values and EMA50Values
+		if len(config.EMAPeriods) >= 1 {
+			ema1Period := config.EMAPeriods[0]
+			if i >= ema1Period-1 {
+				ema1 := calculateEMA(klines[:i+1], ema1Period)
+				data.EMA20Values = append(data.EMA20Values, ema1)
+			}
+		}
+		if len(config.EMAPeriods) >= 2 {
+			ema2Period := config.EMAPeriods[1]
+			if i >= ema2Period-1 {
+				ema2 := calculateEMA(klines[:i+1], ema2Period)
+				data.EMA50Values = append(data.EMA50Values, ema2)
+			}
+		}
+
+		// Calculate MACD with configured periods
+		if i >= config.MACDSlowPeriod-1 {
+			macd := calculateMACD(klines[:i+1], config.MACDFastPeriod, config.MACDSlowPeriod)
+			data.MACDValues = append(data.MACDValues, macd)
+		}
+
+		// Calculate RSI for configured periods (backward compatible)
+		// Use first two RSI periods for RSI7Values and RSI14Values
+		if len(config.RSIPeriods) >= 1 {
+			rsi1Period := config.RSIPeriods[0]
+			if i >= rsi1Period {
+				rsi1 := calculateRSI(klines[:i+1], rsi1Period)
+				data.RSI7Values = append(data.RSI7Values, rsi1)
+			}
+		}
+		if len(config.RSIPeriods) >= 2 {
+			rsi2Period := config.RSIPeriods[1]
+			if i >= rsi2Period {
+				rsi2 := calculateRSI(klines[:i+1], rsi2Period)
+				data.RSI14Values = append(data.RSI14Values, rsi2)
+			}
+		}
+
+		// Calculate Bollinger Bands with configured period
+		if len(config.BOLLPeriods) >= 1 {
+			bollPeriod := config.BOLLPeriods[0]
+			if i >= bollPeriod-1 {
+				upper, middle, lower := calculateBOLL(klines[:i+1], bollPeriod, 2.0)
+				data.BOLLUpper = append(data.BOLLUpper, upper)
+				data.BOLLMiddle = append(data.BOLLMiddle, middle)
+				data.BOLLLower = append(data.BOLLLower, lower)
+			}
+		}
+	}
+
+	// Calculate ATR with configured period (use first ATR period)
+	if len(config.ATRPeriods) >= 1 {
+		data.ATR14 = calculateATR(klines, config.ATRPeriods[0])
+	}
+
+	return data
+}
+
+// calculatePriceChangeByBars calculates how many K-lines to look back for price change based on timeframe
+func calculatePriceChangeByBars(klines []Kline, timeframe string, targetMinutes int) float64 {
+	if len(klines) < 2 {
+		return 0
+	}
+
+	// Parse timeframe to minutes
+	tfMinutes := parseTimeframeToMinutes(timeframe)
+	if tfMinutes <= 0 {
+		return 0
+	}
+
+	// Calculate how many K-lines to look back
+	barsBack := targetMinutes / tfMinutes
+	if barsBack < 1 {
+		barsBack = 1
+	}
+
+	currentPrice := klines[len(klines)-1].Close
+	idx := len(klines) - 1 - barsBack
+	if idx < 0 {
+		idx = 0
+	}
+
+	oldPrice := klines[idx].Close
+	if oldPrice > 0 {
+		return ((currentPrice - oldPrice) / oldPrice) * 100
+	}
+	return 0
+}
+
+// parseTimeframeToMinutes parses timeframe string to minutes
+func parseTimeframeToMinutes(tf string) int {
+	switch tf {
+	case "1m":
+		return 1
+	case "3m":
+		return 3
+	case "5m":
+		return 5
+	case "15m":
+		return 15
+	case "30m":
+		return 30
+	case "1h":
+		return 60
+	case "2h":
+		return 120
+	case "4h":
+		return 240
+	case "6h":
+		return 360
+	case "8h":
+		return 480
+	case "12h":
+		return 720
+	case "1d":
+		return 1440
+	case "3d":
+		return 4320
+	case "1w":
+		return 10080
+	default:
+		return 0
+	}
+}
+
+// calculateEMA calculates EMA
+func calculateEMA(klines []Kline, period int) float64 {
+	if len(klines) < period {
+		return 0
+	}
+
+	// Calculate SMA as initial EMA
+	sum := 0.0
+	for i := 0; i < period; i++ {
+		sum += klines[i].Close
+	}
+	ema := sum / float64(period)
+
+	// Calculate EMA
+	multiplier := 2.0 / float64(period+1)
+	for i := period; i < len(klines); i++ {
+		ema = (klines[i].Close-ema)*multiplier + ema
+	}
+
+	return ema
+}
+
+// calculateMACD calculates MACD with configurable periods
+func calculateMACD(klines []Kline, fastPeriod, slowPeriod int) float64 {
+	// Default values if not specified
+	if fastPeriod == 0 {
+		fastPeriod = 12
+	}
+	if slowPeriod == 0 {
+		slowPeriod = 26
+	}
+
+	// Validate periods
+	if fastPeriod >= slowPeriod {
+		// Fast period should be smaller than slow period, use defaults
+		fastPeriod = 12
+		slowPeriod = 26
+	}
+
+	if len(klines) < slowPeriod {
+		return 0
+	}
+
+	// Calculate fast and slow period EMAs
+	emaFast := calculateEMA(klines, fastPeriod)
+	emaSlow := calculateEMA(klines, slowPeriod)
+
+	// MACD = Fast EMA - Slow EMA
+	return emaFast - emaSlow
+}
+
+// calculateRSI calculates RSI
+func calculateRSI(klines []Kline, period int) float64 {
+	if len(klines) <= period {
+		return 0
+	}
+
+	gains := 0.0
+	losses := 0.0
+
+	// Calculate initial average gain/loss
+	for i := 1; i <= period; i++ {
+		change := klines[i].Close - klines[i-1].Close
+		if change > 0 {
+			gains += change
+		} else {
+			losses += -change
+		}
+	}
+
+	avgGain := gains / float64(period)
+	avgLoss := losses / float64(period)
+
+	// Use Wilder smoothing method to calculate subsequent RSI
+	for i := period + 1; i < len(klines); i++ {
+		change := klines[i].Close - klines[i-1].Close
+		if change > 0 {
+			avgGain = (avgGain*float64(period-1) + change) / float64(period)
+			avgLoss = (avgLoss * float64(period-1)) / float64(period)
+		} else {
+			avgGain = (avgGain * float64(period-1)) / float64(period)
+			avgLoss = (avgLoss*float64(period-1) + (-change)) / float64(period)
+		}
+	}
+
+	if avgLoss == 0 {
+		return 100
+	}
+
+	rs := avgGain / avgLoss
+	rsi := 100 - (100 / (1 + rs))
+
+	return rsi
+}
+
+// calculateATR calculates ATR
+func calculateATR(klines []Kline, period int) float64 {
+	if len(klines) <= period {
+		return 0
+	}
+
+	trs := make([]float64, len(klines))
+	for i := 1; i < len(klines); i++ {
+		high := klines[i].High
+		low := klines[i].Low
+		prevClose := klines[i-1].Close
+
+		tr1 := high - low
+		tr2 := math.Abs(high - prevClose)
+		tr3 := math.Abs(low - prevClose)
+
+		trs[i] = math.Max(tr1, math.Max(tr2, tr3))
+	}
+
+	// Calculate initial ATR
+	sum := 0.0
+	for i := 1; i <= period; i++ {
+		sum += trs[i]
+	}
+	atr := sum / float64(period)
+
+	// Wilder smoothing
+	for i := period + 1; i < len(klines); i++ {
+		atr = (atr*float64(period-1) + trs[i]) / float64(period)
+	}
+
+	return atr
+}
+
+// calculateBOLL calculates Bollinger Bands (upper, middle, lower)
+// period: typically 20, multiplier: typically 2
+func calculateBOLL(klines []Kline, period int, multiplier float64) (upper, middle, lower float64) {
+	if len(klines) < period {
+		return 0, 0, 0
+	}
+
+	// Calculate SMA (middle band)
+	sum := 0.0
+	for i := len(klines) - period; i < len(klines); i++ {
+		sum += klines[i].Close
+	}
+	sma := sum / float64(period)
+
+	// Calculate standard deviation
+	variance := 0.0
+	for i := len(klines) - period; i < len(klines); i++ {
+		diff := klines[i].Close - sma
+		variance += diff * diff
+	}
+	stdDev := math.Sqrt(variance / float64(period))
+
+	// Calculate bands
+	middle = sma
+	upper = sma + multiplier*stdDev
+	lower = sma - multiplier*stdDev
+
+	return upper, middle, lower
+}
+
+// calculateIntradaySeries calculates intraday series data
+func calculateIntradaySeries(klines []Kline) *IntradayData {
+	return calculateIntradaySeriesWithCount(klines, 10, nil) // default to 10 for backward compatibility
+}
+
+// calculateIntradaySeriesWithCount calculates intraday series data with configurable count and indicators
+func calculateIntradaySeriesWithCount(klines []Kline, count int, config *store.IndicatorConfig) *IntradayData {
+	// Set default config if not provided
+	if config == nil {
+		config = &store.IndicatorConfig{
+			EMAPeriods:     []int{20},
+			RSIPeriods:     []int{7, 14},
+			ATRPeriods:     []int{14},
+			MACDFastPeriod: 12,
+			MACDSlowPeriod: 26,
+		}
+	}
+
+	// Set defaults for empty arrays
+	if len(config.EMAPeriods) == 0 {
+		config.EMAPeriods = []int{20}
+	}
+	if len(config.RSIPeriods) == 0 {
+		config.RSIPeriods = []int{7, 14}
+	}
+	if len(config.ATRPeriods) == 0 {
+		config.ATRPeriods = []int{14}
+	}
+	if config.MACDFastPeriod == 0 {
+		config.MACDFastPeriod = 12
+	}
+	if config.MACDSlowPeriod == 0 {
+		config.MACDSlowPeriod = 26
+	}
+
+	data := &IntradayData{
+		MidPrices:   make([]float64, 0),
+		EMA20Values: make([]float64, 0),
+		MACDValues:  make([]float64, 0),
+		RSI7Values:  make([]float64, 0),
+		RSI14Values: make([]float64, 0),
+		Volume:      make([]float64, 0),
+		Count:       0, // Will be set to actual count at the end
+	}
+
+	// Handle edge cases:
+	// count == 0: return empty data
+	// count < 0: use original default of 10
+	if count == 0 {
+		data.ATR14 = 0
+		return data
+	}
+	if count < 0 {
+		count = 10 // original default behavior
+	}
+
+	// Get latest N data points based on configurable count
+	start := len(klines) - count
+	if start < 0 {
+		start = 0
+	}
+
+	for i := start; i < len(klines); i++ {
+		data.MidPrices = append(data.MidPrices, klines[i].Close)
+		data.Volume = append(data.Volume, klines[i].Volume)
+
+		// Calculate EMA using first configured period (backward compatible with EMA20)
+		if len(config.EMAPeriods) >= 1 {
+			emaPeriod := config.EMAPeriods[0]
+			if i >= emaPeriod-1 {
+				ema := calculateEMA(klines[:i+1], emaPeriod)
+				data.EMA20Values = append(data.EMA20Values, ema)
+			}
+		}
+
+		// Calculate MACD with configured periods
+		if i >= config.MACDSlowPeriod-1 {
+			macd := calculateMACD(klines[:i+1], config.MACDFastPeriod, config.MACDSlowPeriod)
+			data.MACDValues = append(data.MACDValues, macd)
+		}
+
+		// Calculate RSI using configured periods (backward compatible with RSI7 and RSI14)
+		if len(config.RSIPeriods) >= 1 {
+			rsi1Period := config.RSIPeriods[0]
+			if i >= rsi1Period {
+				rsi1 := calculateRSI(klines[:i+1], rsi1Period)
+				data.RSI7Values = append(data.RSI7Values, rsi1)
+			}
+		}
+		if len(config.RSIPeriods) >= 2 {
+			rsi2Period := config.RSIPeriods[1]
+			if i >= rsi2Period {
+				rsi2 := calculateRSI(klines[:i+1], rsi2Period)
+				data.RSI14Values = append(data.RSI14Values, rsi2)
+			}
+		}
+	}
+
+	// Calculate ATR using first configured period (backward compatible with ATR14)
+	if len(config.ATRPeriods) >= 1 {
+		data.ATR14 = calculateATR(klines, config.ATRPeriods[0])
+	}
+
+	// Set the actual count of data points processed
+	data.Count = len(data.MidPrices)
+
+	return data
+}
+
+// calculateLongerTermData calculates longer-term data with configurable indicators
+func calculateLongerTermData(klines []Kline, config *store.IndicatorConfig) *LongerTermData {
+	// Set default config if not provided
+	if config == nil {
+		config = &store.IndicatorConfig{
+			EMAPeriods:     []int{20, 50},
+			RSIPeriods:     []int{14},
+			ATRPeriods:     []int{3, 14},
+			MACDFastPeriod: 12,
+			MACDSlowPeriod: 26,
+		}
+	}
+
+	// Set defaults for empty arrays
+	if len(config.EMAPeriods) == 0 {
+		config.EMAPeriods = []int{20, 50}
+	}
+	if len(config.RSIPeriods) == 0 {
+		config.RSIPeriods = []int{14}
+	}
+	if len(config.ATRPeriods) == 0 {
+		config.ATRPeriods = []int{3, 14}
+	}
+	if config.MACDFastPeriod == 0 {
+		config.MACDFastPeriod = 12
+	}
+	if config.MACDSlowPeriod == 0 {
+		config.MACDSlowPeriod = 26
+	}
+
+	data := &LongerTermData{
+		MACDValues:  make([]float64, 0, 10),
+		RSI14Values: make([]float64, 0, 10),
+	}
+
+	// Calculate EMA using configured periods (backward compatible)
+	if len(config.EMAPeriods) >= 1 {
+		data.EMA20 = calculateEMA(klines, config.EMAPeriods[0])
+	}
+	if len(config.EMAPeriods) >= 2 {
+		data.EMA50 = calculateEMA(klines, config.EMAPeriods[1])
+	}
+
+	// Calculate ATR using configured periods (backward compatible with ATR3 and ATR14)
+	if len(config.ATRPeriods) >= 1 {
+		data.ATR3 = calculateATR(klines, config.ATRPeriods[0])
+	}
+	if len(config.ATRPeriods) >= 2 {
+		data.ATR14 = calculateATR(klines, config.ATRPeriods[1])
+	} else if len(config.ATRPeriods) == 1 {
+		// If only one ATR period, use it for both ATR3 and ATR14 fields
+		data.ATR14 = calculateATR(klines, config.ATRPeriods[0])
+	}
+
+	// Calculate volume
+	if len(klines) > 0 {
+		data.CurrentVolume = klines[len(klines)-1].Volume
+		// Calculate average volume
+		sum := 0.0
+		for _, k := range klines {
+			sum += k.Volume
+		}
+		data.AverageVolume = sum / float64(len(klines))
+	}
+
+	// Calculate MACD and RSI series
+	start := len(klines) - 10
+	if start < 0 {
+		start = 0
+	}
+
+	for i := start; i < len(klines); i++ {
+		if i >= config.MACDSlowPeriod-1 {
+			macd := calculateMACD(klines[:i+1], config.MACDFastPeriod, config.MACDSlowPeriod)
+			data.MACDValues = append(data.MACDValues, macd)
+		}
+		// Use first configured RSI period for series (backward compatible with RSI14)
+		if len(config.RSIPeriods) >= 1 {
+			rsiPeriod := config.RSIPeriods[0]
+			if i >= rsiPeriod {
+				rsi := calculateRSI(klines[:i+1], rsiPeriod)
+				data.RSI14Values = append(data.RSI14Values, rsi)
+			}
+		}
+	}
+
+	return data
+}
+
+// getOpenInterestData retrieves OI data
+func getOpenInterestData(symbol string) (*OIData, error) {
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/openInterest?symbol=%s", symbol)
+
+	apiClient := NewAPIClient()
+	resp, err := apiClient.client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		OpenInterest string `json:"openInterest"`
+		Symbol       string `json:"symbol"`
+		Time         int64  `json:"time"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+
+	oi, err := strconv.ParseFloat(result.OpenInterest, 64)
+	if err != nil {
+		logger.Warnf("Failed to parse open interest '%s': %v", result.OpenInterest, err)
+		oi = 0
+	}
+
+	return &OIData{
+		Latest:  oi,
+		Average: oi * 0.999, // Approximate average
+	}, nil
+}
+
+// getFundingRate retrieves funding rate (optimized: uses 1-hour cache)
+func getFundingRate(symbol string) (float64, error) {
+	// Check cache (1-hour validity)
+	// Funding Rate only updates every 8 hours, 1-hour cache is very reasonable
+	if cached, ok := fundingRateMap.Load(symbol); ok {
+		cache := cached.(*FundingRateCache)
+		if time.Since(cache.UpdatedAt) < frCacheTTL {
+			// Cache hit, return directly
+			return cache.Rate, nil
+		}
+	}
+
+	// Cache expired or doesn't exist, call API
+	url := fmt.Sprintf("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=%s", symbol)
+
+	apiClient := NewAPIClient()
+	resp, err := apiClient.client.Get(url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, err
+	}
+
+	var result struct {
+		Symbol          string `json:"symbol"`
+		MarkPrice       string `json:"markPrice"`
+		IndexPrice      string `json:"indexPrice"`
+		LastFundingRate string `json:"lastFundingRate"`
+		NextFundingTime int64  `json:"nextFundingTime"`
+		InterestRate    string `json:"interestRate"`
+		Time            int64  `json:"time"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return 0, err
+	}
+
+	rate, err := strconv.ParseFloat(result.LastFundingRate, 64)
+	if err != nil {
+		logger.Warnf("Failed to parse funding rate '%s': %v", result.LastFundingRate, err)
+		rate = 0
+	}
+
+	// Update cache
+	fundingRateMap.Store(symbol, &FundingRateCache{
+		Rate:      rate,
+		UpdatedAt: time.Now(),
+	})
+
+	return rate, nil
+}
+
+// Format formats and outputs market data
+func Format(data *Data) string {
+	var sb strings.Builder
+
+	// Format price with dynamic precision
+	priceStr := formatPriceWithDynamicPrecision(data.CurrentPrice)
+	sb.WriteString(fmt.Sprintf("current_price = %s, current_ema20 = %.3f, current_macd = %.3f, current_rsi (7 period) = %.3f\n\n",
+		priceStr, data.CurrentEMA20, data.CurrentMACD, data.CurrentRSI7))
+
+	sb.WriteString(fmt.Sprintf("In addition, here is the latest %s open interest and funding rate for perps:\n\n",
+		data.Symbol))
+
+	if data.OpenInterest != nil {
+		// Format OI data with dynamic precision
+		oiLatestStr := formatPriceWithDynamicPrecision(data.OpenInterest.Latest)
+		oiAverageStr := formatPriceWithDynamicPrecision(data.OpenInterest.Average)
+		sb.WriteString(fmt.Sprintf("Open Interest: Latest: %s Average: %s\n\n",
+			oiLatestStr, oiAverageStr))
+	}
+
+	sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
+
+	if data.IntradaySeries != nil {
+		sb.WriteString("Intraday series (3‑minute intervals, oldest → latest):\n\n")
+
+		if len(data.IntradaySeries.MidPrices) > 0 {
+			sb.WriteString(fmt.Sprintf("Mid prices: %s\n\n", formatFloatSlice(data.IntradaySeries.MidPrices)))
+		}
+
+		if len(data.IntradaySeries.EMA20Values) > 0 {
+			sb.WriteString(fmt.Sprintf("EMA indicators (20‑period): %s\n\n", formatFloatSlice(data.IntradaySeries.EMA20Values)))
+		}
+
+		if len(data.IntradaySeries.MACDValues) > 0 {
+			sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.IntradaySeries.MACDValues)))
+		}
+
+		if len(data.IntradaySeries.RSI7Values) > 0 {
+			sb.WriteString(fmt.Sprintf("RSI indicators (7‑Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI7Values)))
+		}
+
+		if len(data.IntradaySeries.RSI14Values) > 0 {
+			sb.WriteString(fmt.Sprintf("RSI indicators (14‑Period): %s\n\n", formatFloatSlice(data.IntradaySeries.RSI14Values)))
+		}
+
+		if len(data.IntradaySeries.Volume) > 0 {
+			sb.WriteString(fmt.Sprintf("Volume: %s\n\n", formatFloatSlice(data.IntradaySeries.Volume)))
+		}
+
+		sb.WriteString(fmt.Sprintf("3m ATR (14‑period): %.3f\n\n", data.IntradaySeries.ATR14))
+	}
+
+	if data.LongerTermContext != nil {
+		sb.WriteString("Longer‑term context (4‑hour timeframe):\n\n")
+
+		sb.WriteString(fmt.Sprintf("20‑Period EMA: %.3f vs. 50‑Period EMA: %.3f\n\n",
+			data.LongerTermContext.EMA20, data.LongerTermContext.EMA50))
+
+		sb.WriteString(fmt.Sprintf("3‑Period ATR: %.3f vs. 14‑Period ATR: %.3f\n\n",
+			data.LongerTermContext.ATR3, data.LongerTermContext.ATR14))
+
+		sb.WriteString(fmt.Sprintf("Current Volume: %.3f vs. Average Volume: %.3f\n\n",
+			data.LongerTermContext.CurrentVolume, data.LongerTermContext.AverageVolume))
+
+		if len(data.LongerTermContext.MACDValues) > 0 {
+			sb.WriteString(fmt.Sprintf("MACD indicators: %s\n\n", formatFloatSlice(data.LongerTermContext.MACDValues)))
+		}
+
+		if len(data.LongerTermContext.RSI14Values) > 0 {
+			sb.WriteString(fmt.Sprintf("RSI indicators (14‑Period): %s\n\n", formatFloatSlice(data.LongerTermContext.RSI14Values)))
+		}
+	}
+
+	// Multi-timeframe data (new)
+	if len(data.TimeframeData) > 0 {
+		// Output sorted by timeframe
+		timeframeOrder := []string{"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"}
+		for _, tf := range timeframeOrder {
+			if tfData, ok := data.TimeframeData[tf]; ok {
+				sb.WriteString(fmt.Sprintf("=== %s Timeframe ===\n\n", strings.ToUpper(tf)))
+				formatTimeframeData(&sb, tfData)
+			}
+		}
+	}
+
+	return sb.String()
+}
+
+// formatTimeframeData formats data for a single timeframe
+func formatTimeframeData(sb *strings.Builder, data *TimeframeSeriesData) {
+	// Use OHLCV table format if kline data is available
+	if len(data.Klines) > 0 {
+		sb.WriteString("Time(UTC)      Open      High      Low       Close     Volume\n")
+		for i, k := range data.Klines {
+			t := time.Unix(k.Time/1000, 0).UTC()
+			timeStr := t.Format("01-02 15:04")
+			marker := ""
+			if i == len(data.Klines)-1 {
+				marker = "  <- current"
+			}
+			fmt.Fprintf(sb, "%-14s %-9.4f %-9.4f %-9.4f %-9.4f %-12.2f%s\n",
+				timeStr, k.Open, k.High, k.Low, k.Close, k.Volume, marker)
+		}
+		sb.WriteString("\n")
+	} else if len(data.MidPrices) > 0 {
+		// Fallback to old format for backward compatibility
+		fmt.Fprintf(sb, "Mid prices: %s\n\n", formatFloatSlice(data.MidPrices))
+		if len(data.Volume) > 0 {
+			fmt.Fprintf(sb, "Volume: %s\n\n", formatFloatSlice(data.Volume))
+		}
+	}
+
+	// Technical indicators
+	if len(data.EMA20Values) > 0 {
+		sb.WriteString(fmt.Sprintf("EMA20: %s\n", formatFloatSlice(data.EMA20Values)))
+	}
+
+	if len(data.EMA50Values) > 0 {
+		sb.WriteString(fmt.Sprintf("EMA50: %s\n", formatFloatSlice(data.EMA50Values)))
+	}
+
+	if len(data.MACDValues) > 0 {
+		sb.WriteString(fmt.Sprintf("MACD: %s\n", formatFloatSlice(data.MACDValues)))
+	}
+
+	if len(data.RSI7Values) > 0 {
+		sb.WriteString(fmt.Sprintf("RSI7: %s\n", formatFloatSlice(data.RSI7Values)))
+	}
+
+	if len(data.RSI14Values) > 0 {
+		sb.WriteString(fmt.Sprintf("RSI14: %s\n", formatFloatSlice(data.RSI14Values)))
+	}
+
+	if data.ATR14 > 0 {
+		sb.WriteString(fmt.Sprintf("ATR14: %.4f\n", data.ATR14))
+	}
+
+	sb.WriteString("\n")
+}
+
+// formatPriceWithDynamicPrecision dynamically selects precision based on price range
+// This perfectly supports all coins from ultra-low price meme coins (< 0.0001) to BTC/ETH
+func formatPriceWithDynamicPrecision(price float64) string {
+	switch {
+	case price < 0.0001:
+		// Ultra-low price meme coins: 1000SATS, 1000WHY, DOGS
+		// 0.00002070 → "0.00002070" (8 decimal places)
+		return fmt.Sprintf("%.8f", price)
+	case price < 0.001:
+		// Low price meme coins: NEIRO, HMSTR, HOT, NOT
+		// 0.00015060 → "0.000151" (6 decimal places)
+		return fmt.Sprintf("%.6f", price)
+	case price < 0.01:
+		// Mid-low price coins: PEPE, SHIB, MEME
+		// 0.00556800 → "0.005568" (6 decimal places)
+		return fmt.Sprintf("%.6f", price)
+	case price < 1.0:
+		// Low price coins: ASTER, DOGE, ADA, TRX
+		// 0.9954 → "0.9954" (4 decimal places)
+		return fmt.Sprintf("%.4f", price)
+	case price < 100:
+		// Mid price coins: SOL, AVAX, LINK, MATIC
+		// 23.4567 → "23.4567" (4 decimal places)
+		return fmt.Sprintf("%.4f", price)
+	default:
+		// High price coins: BTC, ETH (save tokens)
+		// 45678.9123 → "45678.91" (2 decimal places)
+		return fmt.Sprintf("%.2f", price)
+	}
+}
+
+// formatFloatSlice formats float64 slice to string (using dynamic precision)
+func formatFloatSlice(values []float64) string {
+	strValues := make([]string, len(values))
+	for i, v := range values {
+		strValues[i] = formatPriceWithDynamicPrecision(v)
+	}
+	return "[" + strings.Join(strValues, ", ") + "]"
+}
+
+// xyz dex assets that should NOT get USDT suffix
+var xyzDexAssets = map[string]bool{
+	// Stocks
+	"TSLA": true, "NVDA": true, "AAPL": true, "MSFT": true, "META": true,
+	"AMZN": true, "GOOGL": true, "AMD": true, "COIN": true, "NFLX": true,
+	"PLTR": true, "HOOD": true, "INTC": true, "MSTR": true, "TSM": true,
+	"ORCL": true, "MU": true, "RIVN": true, "COST": true, "LLY": true,
+	"CRCL": true, "SKHX": true, "SNDK": true,
+	// Forex
+	"EUR": true, "JPY": true,
+	// Commodities
+	"GOLD": true, "SILVER": true,
+	// Index
+	"XYZ100": true,
+}
+
+// IsXyzDexAsset checks if a symbol is an xyz dex asset
+func IsXyzDexAsset(symbol string) bool {
+	base := strings.ToUpper(symbol)
+	// Remove any prefix/suffix
+	base = strings.TrimPrefix(base, "XYZ:")
+	for _, suffix := range []string{"USDT", "USD", "-USDC"} {
+		if strings.HasSuffix(base, suffix) {
+			base = strings.TrimSuffix(base, suffix)
+			break
+		}
+	}
+	return xyzDexAssets[base]
+}
+
+// Normalize normalizes symbol
+// For crypto: ensures it's a USDT trading pair
+// For xyz dex assets (stocks, forex, commodities): uses xyz: prefix without USDT suffix
+func Normalize(symbol string) string {
+	symbol = strings.ToUpper(symbol)
+
+	// Check if this is an xyz dex asset
+	if IsXyzDexAsset(symbol) {
+		// Remove any xyz: prefix (case-insensitive) and USDT suffix, then add xyz: prefix
+		base := symbol
+		// Handle both lowercase and uppercase xyz: prefix
+		if strings.HasPrefix(strings.ToLower(base), "xyz:") {
+			base = base[4:] // Remove first 4 characters ("xyz:")
+		}
+		for _, suffix := range []string{"USDT", "USD", "-USDC"} {
+			if strings.HasSuffix(base, suffix) {
+				base = strings.TrimSuffix(base, suffix)
+				break
+			}
+		}
+		return "xyz:" + base
+	}
+
+	// For regular crypto assets
+	if strings.HasSuffix(symbol, "USDT") {
+		return symbol
+	}
+	return symbol + "USDT"
+}
+
+// parseFloat parses float value
+func parseFloat(v interface{}) (float64, error) {
+	switch val := v.(type) {
+	case string:
+		return strconv.ParseFloat(val, 64)
+	case float64:
+		return val, nil
+	case int:
+		return float64(val), nil
+	case int64:
+		return float64(val), nil
+	default:
+		return 0, fmt.Errorf("unsupported type: %T", v)
+	}
+}
+
+// BuildDataFromKlines constructs market data snapshot from preloaded K-line series (for backtesting/simulation).
+func BuildDataFromKlines(symbol string, timeframeSeries map[string][]Kline, longerSeries map[string][]Kline, timeframes []string, primaryTimeframe string, klineCount int) *Data {
+	return BuildDataFromKlinesWithConfig(symbol, timeframeSeries, longerSeries, timeframes, primaryTimeframe, klineCount)
+}
+
+// BuildDataFromKlinesWithConfig builds market data with configurable timeframes and kline count
+// This ensures backtest and live trading use the same data structure and kline count
+func BuildDataFromKlinesWithConfig(symbol string, timeframeSeries map[string][]Kline, longerSeries map[string][]Kline, timeframes []string, primaryTimeframe string, klineCount int) *Data {
+	// Get primary timeframe data
+	primary, exists := timeframeSeries[primaryTimeframe]
+	if !exists || len(primary) == 0 {
+		return nil
+	}
+
+	symbol = Normalize(symbol)
+	current := primary[len(primary)-1]
+	currentPrice := current.Close
+
+	// Initialize TimeframeData like live trading does
+	timeframeData := make(map[string]*TimeframeSeriesData)
+
+	// Use default config if not provided
+	defaultConfig := &store.IndicatorConfig{
+		EMAPeriods:     []int{20},
+		RSIPeriods:     []int{7},
+		MACDFastPeriod: 12,
+		MACDSlowPeriod: 26,
+	}
+
+	// Create timeframe data for all requested timeframes using configurable count
+	for _, tf := range timeframes {
+		if klines, exists := timeframeSeries[tf]; exists {
+			seriesData := calculateTimeframeSeries(klines, tf, klineCount, nil)
+			timeframeData[tf] = seriesData
+		}
+	}
+
+	return &Data{
+		Symbol:         symbol,
+		CurrentPrice:   currentPrice,
+		CurrentEMA20:   calculateEMA(primary, defaultConfig.EMAPeriods[0]),
+		CurrentMACD:    calculateMACD(primary, defaultConfig.MACDFastPeriod, defaultConfig.MACDSlowPeriod),
+		CurrentRSI7:    calculateRSI(primary, defaultConfig.RSIPeriods[0]),
+		PriceChange1h:  priceChangeFromSeries(primary, time.Hour),
+		PriceChange4h:  priceChangeFromSeries(primary, 4*time.Hour),
+		OpenInterest:   &OIData{Latest: 0, Average: 0},
+		FundingRate:    0,
+		TimeframeData:  timeframeData,                                              // Use TimeframeData like live trading
+		IntradaySeries: calculateIntradaySeriesWithCount(primary, klineCount, nil), // Use configurable count
+	}
+}
+
+// priceChangeFromSeries calculates price change over specified duration
+func priceChangeFromSeries(series []Kline, duration time.Duration) float64 {
+	if len(series) == 0 || duration <= 0 {
+		return 0
+	}
+	last := series[len(series)-1]
+	target := last.CloseTime - duration.Milliseconds()
+	for i := len(series) - 1; i >= 0; i-- {
+		if series[i].CloseTime <= target {
+			price := series[i].Close
+			if price > 0 {
+				return ((last.Close - price) / price) * 100
+			}
+			break
+		}
+	}
+	return 0
+}
+
+// isStaleData detects stale data (consecutive price freeze)
+// Fix DOGEUSDT-style issue: consecutive N periods with completely unchanged prices indicate data source anomaly
+func isStaleData(klines []Kline, symbol string) bool {
+	if len(klines) < 5 {
+		return false // Insufficient data to determine
+	}
+
+	// Detection threshold: 5 consecutive 3-minute periods with unchanged price (15 minutes without fluctuation)
+	const stalePriceThreshold = 5
+	const priceTolerancePct = 0.0001 // 0.01% fluctuation tolerance (avoid false positives)
+
+	// Take the last stalePriceThreshold K-lines
+	recentKlines := klines[len(klines)-stalePriceThreshold:]
+	firstPrice := recentKlines[0].Close
+
+	// Check if all prices are within tolerance
+	for i := 1; i < len(recentKlines); i++ {
+		priceDiff := math.Abs(recentKlines[i].Close-firstPrice) / firstPrice
+		if priceDiff > priceTolerancePct {
+			return false // Price fluctuation exists, data is normal
+		}
+	}
+
+	// Additional check: MACD and volume
+	// If price is unchanged but MACD/volume shows normal fluctuation, it might be a real market situation (extremely low volatility)
+	// Check if volume is also 0 (data completely frozen)
+	allVolumeZero := true
+	for _, k := range recentKlines {
+		if k.Volume > 0 {
+			allVolumeZero = false
+			break
+		}
+	}
+
+	if allVolumeZero {
+		logger.Infof("⚠️  %s stale data confirmed: price freeze + zero volume", symbol)
+		return true
+	}
+
+	// Price frozen but has volume: might be extremely low volatility market, allow but log warning
+	logger.Infof("⚠️  %s detected extreme price stability (no fluctuation for %d consecutive periods), but volume is normal", symbol, stalePriceThreshold)
+	return false
+}

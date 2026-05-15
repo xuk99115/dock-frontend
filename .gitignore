@@ -1,0 +1,66 @@
+# IDE
+.idea/
+*.iml
+*.xml
+.vscode/
+
+# AI tools
+.claude/
+CLAUDE.md
+
+# Build outputs
+nofx
+nofx-auto
+nofx-backend
+*.exe
+*.test
+*.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.log
+*.tmp
+*.bak
+*.backup
+
+# Environment
+.env
+.env.*
+config.json
+configbak.json
+
+# Data directories
+data/
+*.db
+ai_cache.json
+decision_logs/
+
+# Node.js
+node_modules/
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Keys and secrets
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+rsa_key*
+
+# Docker
+.dockerignore
