@@ -229,6 +229,11 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		mcpClient.SetAPIKey(config.CustomAPIKey, config.CustomAPIURL, config.CustomModelName)
 		logger.Infof("🤖 [%s] Using xAI Grok AI", config.Name)
 
+	case "minimax":
+		mcpClient = mcp.NewMiniMaxClient()
+		mcpClient.SetAPIKey(config.CustomAPIKey, config.CustomAPIURL, config.CustomModelName)
+		logger.Infof("🤖 [%s] Using MiniMax AI", config.Name)
+
 	case "openai":
 		mcpClient = mcp.NewOpenAIClient()
 		mcpClient.SetAPIKey(config.CustomAPIKey, config.CustomAPIURL, config.CustomModelName)

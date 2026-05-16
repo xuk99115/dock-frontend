@@ -100,6 +100,11 @@ const AI_PROVIDER_CONFIG: Record<string, {
     apiUrl: 'https://platform.moonshot.ai/console/api-keys',
     apiName: 'Moonshot',
   },
+  minimax: {
+    defaultModel: 'MiniMax-M2.7',
+    apiUrl: 'https://www.minimaxi.com/console/api_keys',
+    apiName: 'MiniMax',
+  },
 }
 
 interface AITradersPageProps {
