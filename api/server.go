@@ -2708,6 +2708,77 @@ func (s *Server) handleSymbols(c *gin.Context) {
 			}
 		}
 
+	case "okx":
+		// OKX futures symbols - common USDT margined perpetuals
+		okxSymbols := []SymbolInfo{
+			{Symbol: "BTCUSDT", Name: "Bitcoin", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "ETHUSDT", Name: "Ethereum", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "SOLUSDT", Name: "Solana", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "BNBUSDT", Name: "BNB", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "XRPUSDT", Name: "Ripple", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "DOGEUSDT", Name: "Dogecoin", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "ADAUSDT", Name: "Cardano", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "AVAXUSDT", Name: "Avalanche", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "DOTUSDT", Name: "Polkadot", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "LINKUSDT", Name: "Chainlink", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "MATICUSDT", Name: "Polygon", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "LTCUSDT", Name: "Litecoin", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "UNIUSDT", Name: "Uniswap", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "ATOMUSDT", Name: "Cosmos", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "KASUSDT", Name: "Kaspa", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "FTMUSDT", Name: "Fantom", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "NEARUSDT", Name: "NEAR Protocol", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "FILUSDT", Name: "Filecoin", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "APTUSDT", Name: "Aptos", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "ARBUSDT", Name: "Arbitrum", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "OPUSDT", Name: "Optimism", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "SUIUSDT", Name: "Sui", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "SEIUSDT", Name: "Sei", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "TIAUSDT", Name: "Celestia", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "SANDUSDT", Name: "The Sandbox", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "MANAUSDT", Name: "Decentraland", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "AAVEUSDT", Name: "Aave", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "GRTUSDT", Name: "The Graph", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "STXUSDT", Name: "Stacks", Category: "crypto", MaxLeverage: 20},
+			{Symbol: "IMXUSDT", Name: "Immutable", Category: "crypto", MaxLeverage: 20},
+		}
+		symbols = append(symbols, okxSymbols...)
+
+	case "binance", "binance- futures":
+		binanceSymbols := []SymbolInfo{
+			{Symbol: "BTCUSDT", Name: "Bitcoin", Category: "crypto", MaxLeverage: 125},
+			{Symbol: "ETHUSDT", Name: "Ethereum", Category: "crypto", MaxLeverage: 125},
+			{Symbol: "SOLUSDT", Name: "Solana", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "BNBUSDT", Name: "BNB", Category: "crypto", MaxLeverage: 125},
+			{Symbol: "XRPUSDT", Name: "Ripple", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "DOGEUSDT", Name: "Dogecoin", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "ADAUSDT", Name: "Cardano", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "AVAXUSDT", Name: "Avalanche", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "DOTUSDT", Name: "Polkadot", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "LINKUSDT", Name: "Chainlink", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "MATICUSDT", Name: "Polygon", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "LTCUSDT", Name: "Litecoin", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "UNIUSDT", Name: "Uniswap", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "ATOMUSDT", Name: "Cosmos", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "KASUSDT", Name: "Kaspa", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "FTMUSDT", Name: "Fantom", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "NEARUSDT", Name: "NEAR Protocol", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "FILUSDT", Name: "Filecoin", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "APTUSDT", Name: "Aptos", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "ARBUSDT", Name: "Arbitrum", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "OPUSDT", Name: "Optimism", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "INJUSDT", Name: "Injective", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "SUIUSDT", Name: "Sui", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "SEIUSDT", Name: "Sei", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "TIAUSDT", Name: "Celestia", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "PEPEUSDT", Name: "Pepe", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "WIFUSDT", Name: "dogwifhat", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "BONKUSDT", Name: "Bonk", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "FLOKIUSDT", Name: "FLOKI", Category: "crypto", MaxLeverage: 50},
+			{Symbol: "SHIBUSDT", Name: "Shiba Inu", Category: "crypto", MaxLeverage: 50},
+		}
+		symbols = append(symbols, binanceSymbols...)
+
 	default:
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported exchange for symbol listing"})
 		return

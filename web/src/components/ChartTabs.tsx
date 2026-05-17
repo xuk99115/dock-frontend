@@ -15,7 +15,7 @@ interface ChartTabsProps {
 
 type ChartTab = 'equity' | 'kline'
 type Interval = '1m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d'
-type MarketType = 'hyperliquid' | 'crypto' | 'stocks' | 'forex' | 'metals'
+type MarketType = 'hyperliquid' | 'okx' | 'binance' | 'crypto' | 'stocks' | 'forex' | 'metals'
 
 interface SymbolInfo {
   symbol: string
@@ -26,7 +26,9 @@ interface SymbolInfo {
 // 市场类型配置
 const MARKET_CONFIG = {
   hyperliquid: { exchange: 'hyperliquid', defaultSymbol: 'BTC', icon: '🔷', label: { zh: 'HL', en: 'HL' }, color: 'cyan', hasDropdown: true },
-  crypto: { exchange: 'binance', defaultSymbol: 'BTCUSDT', icon: '₿', label: { zh: '加密', en: 'Crypto' }, color: 'yellow', hasDropdown: false },
+  okx: { exchange: 'okx', defaultSymbol: 'BTCUSDT', icon: '₿', label: { zh: 'OKX', en: 'OKX' }, color: 'yellow', hasDropdown: true },
+  binance: { exchange: 'binance', defaultSymbol: 'BTCUSDT', icon: '₿', label: { zh: '币安', en: 'Binance' }, color: 'yellow', hasDropdown: true },
+  crypto: { exchange: 'binance', defaultSymbol: 'BTCUSDT', icon: '₿', label: { zh: '加密', en: 'Crypto' }, color: 'yellow', hasDropdown: true },
   stocks: { exchange: 'alpaca', defaultSymbol: 'AAPL', icon: '📈', label: { zh: '美股', en: 'Stocks' }, color: 'green', hasDropdown: false },
   forex: { exchange: 'forex', defaultSymbol: 'EUR/USD', icon: '💱', label: { zh: '外汇', en: 'Forex' }, color: 'blue', hasDropdown: false },
   metals: { exchange: 'metals', defaultSymbol: 'XAU/USD', icon: '🥇', label: { zh: '金属', en: 'Metals' }, color: 'amber', hasDropdown: false },
@@ -44,11 +46,13 @@ const INTERVALS: { value: Interval; label: string }[] = [
 
 // 根据交易所ID推断市场类型
 function getMarketTypeFromExchange(exchangeId: string | undefined): MarketType {
-  if (!exchangeId) return 'hyperliquid'
+  if (!exchangeId) return 'okx'
   const lower = exchangeId.toLowerCase()
   if (lower.includes('hyperliquid')) return 'hyperliquid'
-  // 其他交易所默认使用 crypto 类型
-  return 'crypto'
+  if (lower.includes('okx')) return 'okx'
+  if (lower.includes('binance')) return 'binance'
+  // 其他交易所默认使用 okx 类型
+  return 'okx'
 }
 
 export function ChartTabs({ traderId, selectedSymbol, updateKey, exchangeId }: ChartTabsProps) {
